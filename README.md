@@ -31,6 +31,18 @@ Generate LLVM IR log for a chosen MMVQ symbol:
 
 If `--filter` matches multiple symbols (or is omitted), the tool will prompt you to select one.
 
+Build and apply a modified code object by splicing the selected `llvmir/<symbol>/asm.s` into the full `amdgcn.s`, rebundling, and updating both `mmvq.cu.o` and `libggml-hip.so.0`:
+
+```
+./llama-kernel patch --filter "mul_mat_vec_q<(ggml_type)3, 1, false>"
+```
+
+Restore the original object and library (uses `mmvq.cu.o.bak` and `libggml-hip.so.0.bak` if present, otherwise rebuilds `mmvq.cu.o` from `compile_commands.json` and `libggml-hip.so.0` from `ggml-hip`):
+
+```
+./llama-kernel restore
+```
+
 ## Output layout
 
 ```
@@ -42,6 +54,12 @@ If `--filter` matches multiple symbols (or is omitted), the tool will prompt you
     llvmir.log
     asm.s
     metadata.txt
+  modified/
+    amdgcn.s
+    kernel.device.o
+    kernel.device.hsaco
+    hip_fatbin.bin
+    hip_fatbin.new
 ```
 
 ## Notes

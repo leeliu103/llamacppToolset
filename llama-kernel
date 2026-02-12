@@ -93,6 +93,17 @@ def find_compile_commands(llamacpp: Path, build_dir: Path | None) -> Path:
     raise ToolError(msg.rstrip())
 
 
+def build_root_from_cc(cc_path: Path, cfg: dict) -> Path:
+    build_dir = cfg.get("build_dir")
+    if build_dir:
+        if isinstance(build_dir, Path):
+            bd = build_dir
+        else:
+            bd = Path(build_dir)
+        return bd.parent if bd.is_file() else bd
+    return cc_path.parent
+
+
 def load_compile_command(cc_path: Path, tu_rel: str) -> dict:
     with cc_path.open("r", encoding="utf-8") as f:
         data = json.load(f)
@@ -125,6 +136,9 @@ def clang_tools_from_command(cmd: list[str]) -> dict:
         "llvm_dis": tool("llvm-dis"),
         "llvm_objcopy": tool("llvm-objcopy"),
         "llvm_readobj": tool("llvm-readobj"),
+        "llvm_mc": tool("llvm-mc"),
+        "ld_lld": tool("ld.lld"),
+        "clang_offload_bundler": tool("clang-offload-bundler"),
     }
 
 
@@ -144,6 +158,43 @@ def build_command(entry: dict, out_obj: Path, extra_flags: list[str]) -> tuple[l
 
     cmd += extra_flags
     return cmd, workdir
+
+
+def parse_offload_arch(cmd: list[str]) -> str:
+    # Prefer explicit --offload-arch flags
+    for i, arg in enumerate(cmd):
+        if arg.startswith("--offload-arch="):
+            return arg.split("=", 1)[1]
+        if arg == "--offload-arch" and i + 1 < len(cmd):
+            return cmd[i + 1]
+        if arg.startswith("-foffload-arch="):
+            return arg.split("=", 1)[1]
+        if arg == "-foffload-arch" and i + 1 < len(cmd):
+            return cmd[i + 1]
+    raise ToolError("Missing --offload-arch in compile command. Rebuild with GPU target specified.")
+
+
+def find_output_object(entry: dict, cc_path: Path) -> Path:
+    if "output" in entry and entry["output"]:
+        out = Path(entry["output"])
+    else:
+        cmd = shlex.split(entry["command"])
+        if "-o" not in cmd:
+            raise ToolError("Cannot find output object path in compile command.")
+        out = Path(cmd[cmd.index("-o") + 1])
+    if not out.is_absolute():
+        out = Path(entry["directory"]) / out
+    out = out.resolve()
+    if out.exists():
+        return out
+
+    # Fallback: search for mmvq.cu.o under the build root (parent of compile_commands.json)
+    build_root = cc_path.parent
+    candidates = list(build_root.rglob("mmvq.cu.o"))
+    if not candidates:
+        raise ToolError(f"Output object not found: {out}")
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0].resolve()
 
 
 def pick_latest_dir(base: Path) -> Path | None:
@@ -334,6 +385,36 @@ def extract_asm_block(amdgcn_s: Path, symbol: str, out_path: Path):
         eprint(f"[llvmir] warning: symbol not found in amdgcn.s: {symbol}")
 
 
+def replace_section(full_s: Path, symbol: str, snippet_s: Path, out_s: Path):
+    start_pat = re.compile(r"^\s*\.section\s+\.text\." + re.escape(symbol) + r"\b")
+    next_section_pat = re.compile(r"^\s*\.section\s+\.text\.")
+
+    full_lines = full_s.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+    snippet_lines = snippet_s.read_text(encoding="utf-8", errors="ignore").splitlines(keepends=True)
+
+    if not any(start_pat.search(line) for line in snippet_lines):
+        raise ToolError("Snippet asm does not contain the expected .text.<symbol> section.")
+
+    start_idx = None
+    end_idx = None
+    for i, line in enumerate(full_lines):
+        if start_pat.search(line):
+            start_idx = i
+            break
+    if start_idx is None:
+        raise ToolError("Symbol section not found in full amdgcn.s.")
+
+    for j in range(start_idx + 1, len(full_lines)):
+        if next_section_pat.search(full_lines[j]) and not start_pat.search(full_lines[j]):
+            end_idx = j
+            break
+    if end_idx is None:
+        end_idx = len(full_lines)
+
+    new_lines = full_lines[:start_idx] + snippet_lines + full_lines[end_idx:]
+    out_s.write_text("".join(new_lines), encoding="utf-8")
+
+
 def extract_metadata_from_readobj(readobj: str, obj_path: Path, symbol: str, out_path: Path):
     proc = subprocess.run(
         [readobj, "--notes", str(obj_path)],
@@ -460,6 +541,182 @@ def run_llvmir(cfg: dict, filt: str | None):
     clean_dir(sym_dir, keep_files={"llvmir.log", "asm.s", "metadata.txt"})
 
 
+def run_patch(cfg: dict, filt: str | None):
+    kernel = cfg["kernel"]
+    out_base = cfg["out"]
+
+    kernel_dir = out_base / kernel
+    dump_dir = pick_latest_dir(kernel_dir)
+    if dump_dir is None or not (dump_dir / "amdgcn.s").exists():
+        raise ToolError("Base amdgcn.s not found. Run `llama-kernel dump` first.")
+
+    map_path = dump_dir / "mangled_map.tsv"
+    if not map_path.exists():
+        raise ToolError("mangled_map.tsv not found. Run `llama-kernel dump` first.")
+
+    items = load_map(map_path)
+    if not items:
+        raise ToolError("mangled_map.tsv is empty.")
+
+    if filt:
+        mangled, demangled = filter_pick(items, filt)
+    else:
+        mangled, demangled = prompt_pick(items)
+
+    eprint(f"[patch] selected: {demangled}")
+
+    # Locate snippet asm
+    sym_dir = dump_dir / "llvmir" / safe_name(mangled)
+    snippet_path = sym_dir / "asm.s"
+    if not snippet_path.exists():
+        raise ToolError(f"Missing asm.s for symbol. Run llvmir first: {sym_dir}")
+
+    modified_dir = dump_dir / "modified"
+    if modified_dir.exists():
+        shutil.rmtree(modified_dir)
+    modified_dir.mkdir(parents=True, exist_ok=True)
+
+    full_s = dump_dir / "amdgcn.s"
+    combined_s = modified_dir / "amdgcn.s"
+    replace_section(full_s, mangled, snippet_path, combined_s)
+
+    # Build code object from modified assembly
+    tu_rel = SUPPORTED_KERNELS[kernel]
+    cc_path = find_compile_commands(cfg["llamacpp"], cfg.get("build_dir"))
+    entry = load_compile_command(cc_path, tu_rel)
+    cmd_tools = clang_tools_from_command(shlex.split(entry["command"]))
+    cmd = shlex.split(entry["command"])
+    arch = parse_offload_arch(cmd)
+
+    device_o = modified_dir / "kernel.device.o"
+    device_hsaco = modified_dir / "kernel.device.hsaco"
+
+    proc = subprocess.run(
+        [cmd_tools["llvm_mc"], "-triple=amdgcn-amd-amdhsa", f"-mcpu={arch}", "-filetype=obj",
+         str(combined_s), "-o", str(device_o)]
+    )
+    if proc.returncode != 0:
+        raise ToolError("llvm-mc failed.")
+
+    proc = subprocess.run([cmd_tools["ld_lld"], "-shared", "-o", str(device_hsaco), str(device_o)])
+    if proc.returncode != 0:
+        raise ToolError("ld.lld failed.")
+
+    # Extract and re-bundle hip fatbin
+    obj_path = find_output_object(entry, cc_path)
+    hip_fatbin = modified_dir / "hip_fatbin.bin"
+    proc = subprocess.run(
+        [cmd_tools["llvm_objcopy"], f"--dump-section", f".hip_fatbin={hip_fatbin}", str(obj_path)]
+    )
+    if proc.returncode != 0:
+        raise ToolError("Failed to dump .hip_fatbin section from mmvq.cu.o.")
+
+    host_o = modified_dir / "hip_fatbin.host.o"
+    device_o_orig = modified_dir / "hip_fatbin.device.o"
+    targets = f"hipv4-amdgcn-amd-amdhsa--{arch},host-x86_64-unknown-linux-gnu-"
+
+    proc = subprocess.run(
+        [cmd_tools["clang_offload_bundler"],
+         "--type=o", "--unbundle",
+         "--input", str(hip_fatbin),
+         "--output", str(device_o_orig),
+         "--output", str(host_o),
+         "--targets", targets]
+    )
+    if proc.returncode != 0:
+        raise ToolError("clang-offload-bundler unbundle failed.")
+
+    hip_fatbin_new = modified_dir / "hip_fatbin.new"
+    proc = subprocess.run(
+        [cmd_tools["clang_offload_bundler"],
+         "--type=o",
+         "--input", str(device_hsaco),
+         "--input", str(host_o),
+         "--output", str(hip_fatbin_new),
+         "--targets", targets]
+    )
+    if proc.returncode != 0:
+        raise ToolError("clang-offload-bundler bundle failed.")
+
+    # Apply patch to the real object file (backup first)
+    backup_path = obj_path.with_suffix(obj_path.suffix + ".bak")
+    if not backup_path.exists():
+        shutil.copy2(obj_path, backup_path)
+        eprint(f"[patch] backed up: {backup_path}")
+
+    proc = subprocess.run(
+        [cmd_tools["llvm_objcopy"], f"--update-section", f".hip_fatbin={hip_fatbin_new}", str(obj_path)]
+    )
+    if proc.returncode != 0:
+        raise ToolError("Failed to update .hip_fatbin section in mmvq.cu.o.")
+
+    eprint(f"[patch] applied to: {obj_path}")
+    eprint(f"[patch] modified artifacts in: {modified_dir}")
+    eprint(f"[patch] hip_fatbin.new ready: {hip_fatbin_new}")
+
+    # Apply the same patched fatbin to the runtime shared library
+    build_root = build_root_from_cc(cc_path, cfg)
+    so_path = build_root / "bin" / "libggml-hip.so.0"
+    if not so_path.exists():
+        raise ToolError(f"libggml-hip.so.0 not found: {so_path}")
+
+    so_backup = so_path.with_suffix(so_path.suffix + ".bak")
+    if not so_backup.exists():
+        shutil.copy2(so_path, so_backup)
+        eprint(f"[patch] backed up: {so_backup}")
+
+    proc = subprocess.run(
+        [cmd_tools["llvm_objcopy"], f"--update-section", f".hip_fatbin={hip_fatbin_new}", str(so_path)]
+    )
+    if proc.returncode != 0:
+        raise ToolError("Failed to update .hip_fatbin section in libggml-hip.so.0.")
+
+    eprint(f"[patch] applied to: {so_path}")
+
+
+def run_restore(cfg: dict):
+    kernel = cfg["kernel"]
+    tu_rel = SUPPORTED_KERNELS[kernel]
+    llamacpp = cfg["llamacpp"]
+
+    cc_path = find_compile_commands(llamacpp, cfg.get("build_dir"))
+    entry = load_compile_command(cc_path, tu_rel)
+    cmd_tools = clang_tools_from_command(shlex.split(entry["command"]))
+
+    obj_path = find_output_object(entry, cc_path)
+    backup_path = obj_path.with_suffix(obj_path.suffix + ".bak")
+
+    if backup_path.exists():
+        shutil.copy2(backup_path, obj_path)
+        eprint(f"[restore] restored from backup: {backup_path}")
+    else:
+        # Rebuild just mmvq.cu.o using the exact compile command
+        cmd = shlex.split(entry["command"])
+        workdir = Path(entry["directory"])
+
+        proc = subprocess.run(cmd, cwd=workdir)
+        if proc.returncode != 0:
+            raise ToolError("Restore rebuild failed.")
+        eprint("[restore] rebuilt mmvq.cu.o from compile_commands.json")
+
+    # Restore libggml-hip.so.0 if available, otherwise rebuild ggml-hip
+    build_root = build_root_from_cc(cc_path, cfg)
+    so_path = build_root / "bin" / "libggml-hip.so.0"
+    so_backup = so_path.with_suffix(so_path.suffix + ".bak")
+    if so_backup.exists():
+        shutil.copy2(so_backup, so_path)
+        eprint(f"[restore] restored from backup: {so_backup}")
+        return
+
+    if not build_root.exists():
+        raise ToolError(f"Build directory not found for ggml-hip rebuild: {build_root}")
+
+    proc = subprocess.run(["cmake", "--build", str(build_root), "--target", "ggml-hip", "--clean-first"])
+    if proc.returncode != 0:
+        raise ToolError("Restore rebuild of ggml-hip failed.")
+    eprint("[restore] rebuilt ggml-hip")
+
+
 def main():
     parser = argparse.ArgumentParser(description="llama-kernel tool")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -467,6 +724,9 @@ def main():
     sub.add_parser("dump", help="dump amdgcn.s, device.bc, and mangled map")
     p_ir = sub.add_parser("llvmir", help="dump LLVM IR for a selected symbol")
     p_ir.add_argument("--filter", dest="filter", default=None, help="demangled substring to select symbol")
+    p_patch = sub.add_parser("patch", help="build modified code object and apply to mmvq.cu.o")
+    p_patch.add_argument("--filter", dest="filter", default=None, help="demangled substring to select symbol")
+    sub.add_parser("restore", help="restore mmvq.cu.o from backup or rebuild it")
 
     args = parser.parse_args()
 
@@ -477,6 +737,10 @@ def main():
             run_dump(cfg)
         elif args.cmd == "llvmir":
             run_llvmir(cfg, args.filter)
+        elif args.cmd == "patch":
+            run_patch(cfg, args.filter)
+        elif args.cmd == "restore":
+            run_restore(cfg)
         else:
             raise ToolError(f"Unknown command: {args.cmd}")
     except ToolError as e:
