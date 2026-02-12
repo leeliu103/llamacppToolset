@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+import tomllib
+
+
+CONFIG_BASENAME = "llama-kernel.toml"
+SUPPORTED_KERNELS = {"mmvq": "ggml/src/ggml-cuda/mmvq.cu"}
+
+
+class ToolError(RuntimeError):
+    pass
+
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def load_config() -> dict:
+    config_path = os.environ.get("LLAMA_KERNEL_CONFIG")
+    candidates = []
+    if config_path:
+        candidates.append(Path(config_path))
+    candidates.append(Path.cwd() / CONFIG_BASENAME)
+    candidates.append(Path(__file__).resolve().parent / CONFIG_BASENAME)
+
+    for path in candidates:
+        if path.exists():
+            with path.open("rb") as f:
+                data = tomllib.load(f)
+            data["_config_path"] = str(path)
+            return data
+
+    raise ToolError(
+        "Config not found. Set LLAMA_KERNEL_CONFIG or place llama-kernel.toml in the current directory or next to the script."
+    )
+
+
+def resolve_paths(cfg: dict) -> dict:
+    llamacpp = Path(cfg.get("llamacpp", "")).expanduser()
+    out_base = Path(cfg.get("out", "")).expanduser()
+    kernel = cfg.get("kernel", "")
+    build_dir = cfg.get("build_dir")
+
+    if not llamacpp:
+        raise ToolError("Config missing 'llamacpp'.")
+    if not out_base:
+        raise ToolError("Config missing 'out'.")
+    if not kernel:
+        raise ToolError("Config missing 'kernel'.")
+    if kernel not in SUPPORTED_KERNELS:
+        raise ToolError(f"Unsupported kernel '{kernel}'. Supported: {', '.join(SUPPORTED_KERNELS)}")
+
+    cfg["llamacpp"] = llamacpp
+    cfg["out"] = out_base
+    cfg["kernel"] = kernel
+    cfg["build_dir"] = Path(build_dir).expanduser() if build_dir else None
+    return cfg
+
+
+def find_compile_commands(llamacpp: Path, build_dir: Path | None) -> Path:
+    if build_dir:
+        if build_dir.is_file() and build_dir.name == "compile_commands.json":
+            return build_dir
+        cc = build_dir / "compile_commands.json"
+        if cc.exists():
+            return cc
+        raise ToolError(f"compile_commands.json not found under build_dir: {build_dir}")
+
+    preferred = llamacpp / "build" / "compile_commands.json"
+    if preferred.exists():
+        return preferred
+
+    candidates = list(llamacpp.rglob("compile_commands.json"))
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise ToolError("No compile_commands.json found. Reconfigure CMake with -DCMAKE_EXPORT_COMPILE_COMMANDS=ON.")
+
+    msg = "Multiple compile_commands.json found. Set build_dir in config.\n"
+    for c in candidates:
+        msg += f"  - {c}\n"
+    raise ToolError(msg.rstrip())
+
+
+def load_compile_command(cc_path: Path, tu_rel: str) -> dict:
+    with cc_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    for entry in data:
+        file_path = entry.get("file", "")
+        if file_path.replace("\\", "/").endswith(tu_rel):
+            return entry
+
+    raise ToolError(f"No compile command found for {tu_rel} in {cc_path}")
+
+
+def clang_tools_from_command(cmd: list[str]) -> dict:
+    clang = cmd[0]
+    clang_path = Path(clang)
+    tool_dir = clang_path.parent if clang_path.exists() else None
+
+    def tool(name: str) -> str:
+        if tool_dir:
+            candidate = tool_dir / name
+            if candidate.exists():
+                return str(candidate)
+        found = shutil.which(name)
+        if found:
+            return found
+        raise ToolError(f"Required tool '{name}' not found.")
+
+    return {
+        "clang": clang,
+        "llvm_dis": tool("llvm-dis"),
+        "llvm_objcopy": tool("llvm-objcopy"),
+        "llvm_readobj": tool("llvm-readobj"),
+    }
+
+
+def build_command(entry: dict, out_obj: Path, extra_flags: list[str]) -> tuple[list[str], Path]:
+    cmd = shlex.split(entry["command"])
+    workdir = Path(entry["directory"])
+
+    # Replace -o output
+    if "-o" in cmd:
+        i = cmd.index("-o")
+        cmd[i + 1] = str(out_obj)
+    else:
+        cmd += ["-o", str(out_obj)]
+
+    # Remove existing save-temps flags to avoid duplicates
+    cmd = [c for c in cmd if not c.startswith("--save-temps")]
+
+    cmd += extra_flags
+    return cmd, workdir
+
+
+def pick_latest_dir(base: Path) -> Path | None:
+    if not base.exists():
+        return None
+    return base
+
+
+def safe_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]", "_", name)
+    if len(cleaned) <= 80:
+        return cleaned
+    h = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    return f"{cleaned[:72]}_{h}"
+
+
+def find_device_artifacts(out_dir: Path) -> tuple[Path, Path]:
+    device_s = list(out_dir.glob("*amdgcn-amd-amdhsa*.s"))
+    device_bc = list(out_dir.glob("*amdgcn-amd-amdhsa*.bc"))
+
+    if not device_s:
+        raise ToolError("Device .s not found in output directory.")
+    if not device_bc:
+        raise ToolError("Device .bc not found in output directory.")
+
+    device_s.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    device_bc.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return device_s[0], device_bc[0]
+
+
+def find_device_out(out_dir: Path) -> Path | None:
+    device_out = list(out_dir.glob("*amdgcn-amd-amdhsa*.out"))
+    if not device_out:
+        return None
+    device_out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return device_out[0]
+
+
+def generate_mangled_map(llvm_dis: str, bc_path: Path, out_map: Path) -> int:
+    proc = subprocess.run([llvm_dis, str(bc_path), "-o", "-"],
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        eprint(proc.stderr)
+        raise ToolError("llvm-dis failed.")
+
+    mangled = []
+    seen = set()
+    for line in proc.stdout.splitlines():
+        if "define " in line and "@" in line:
+            start = line.find("@") + 1
+            end = line.find("(", start)
+            if end == -1:
+                continue
+            sym = line[start:end].strip()
+            if sym and sym not in seen:
+                seen.add(sym)
+                mangled.append(sym)
+
+    proc_dem = subprocess.run(["c++filt"], input="\n".join(mangled) + "\n",
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc_dem.returncode != 0:
+        eprint(proc_dem.stderr)
+        raise ToolError("c++filt failed.")
+
+    demangled = proc_dem.stdout.splitlines()
+    with out_map.open("w", encoding="utf-8") as f:
+        for m, d in zip(mangled, demangled):
+            f.write(f"{m}\t{d}\n")
+
+    return len(mangled)
+
+
+def clean_dir(path: Path, keep_files: set[str], keep_dirs: set[str] | None = None):
+    keep_dirs = keep_dirs or set()
+    for child in path.iterdir():
+        if child.is_dir():
+            if child.name in keep_dirs:
+                continue
+            shutil.rmtree(child)
+            continue
+        if child.name in keep_files:
+            continue
+        child.unlink()
+
+
+def run_dump(cfg: dict) -> Path:
+    kernel = cfg["kernel"]
+    tu_rel = SUPPORTED_KERNELS[kernel]
+    llamacpp = cfg["llamacpp"]
+    out_base = cfg["out"]
+
+    cc_path = find_compile_commands(llamacpp, cfg.get("build_dir"))
+    entry = load_compile_command(cc_path, tu_rel)
+    cmd_tools = clang_tools_from_command(shlex.split(entry["command"]))
+
+    kernel_dir = out_base / kernel
+    if kernel_dir.exists():
+        shutil.rmtree(kernel_dir)
+    kernel_dir.mkdir(parents=True, exist_ok=True)
+    dump_dir = kernel_dir
+
+    out_obj = dump_dir / "mmvq.cu.o"
+    extra = ["--save-temps=obj"]
+    cmd, workdir = build_command(entry, out_obj, extra)
+
+    eprint(f"[dump] compile from {cc_path}")
+    eprint(f"[dump] output: {dump_dir}")
+
+    proc = subprocess.run(cmd, cwd=workdir)
+    if proc.returncode != 0:
+        raise ToolError("Compilation failed during dump.")
+
+    device_s, device_bc = find_device_artifacts(dump_dir)
+    shutil.copy2(device_s, dump_dir / "amdgcn.s")
+    shutil.copy2(device_bc, dump_dir / "device.bc")
+
+    map_path = dump_dir / "mangled_map.tsv"
+    count = generate_mangled_map(cmd_tools["llvm_dis"], dump_dir / "device.bc", map_path)
+
+    clean_dir(dump_dir, keep_files={"amdgcn.s", "device.bc", "mangled_map.tsv"}, keep_dirs={"llvmir"})
+    eprint(f"[dump] symbols mapped: {count}")
+    return dump_dir
+
+
+def load_map(map_path: Path) -> list[tuple[str, str]]:
+    items = []
+    with map_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            if "\t" not in line:
+                continue
+            m, d = line.split("\t", 1)
+            items.append((m, d))
+    return items
+
+
+def prompt_pick(items: list[tuple[str, str]]) -> tuple[str, str]:
+    for idx, (_, dem) in enumerate(items, start=1):
+        print(f"[{idx:3d}] {dem}")
+    while True:
+        try:
+            choice = input("Select index (q to quit): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            raise ToolError("Selection aborted (no interactive input available).")
+        if choice.lower() in {"q", "quit", "exit"}:
+            raise ToolError("Selection aborted by user.")
+        if not choice.isdigit():
+            print("Please enter a number.")
+            continue
+        idx = int(choice)
+        if 1 <= idx <= len(items):
+            return items[idx - 1]
+        print("Index out of range.")
+
+
+def filter_pick(items: list[tuple[str, str]], filt: str) -> tuple[str, str]:
+    matches = [(m, d) for m, d in items if filt in d]
+    if not matches:
+        raise ToolError("No matches for filter. Run llvmir without --filter to choose from the list.")
+    if len(matches) == 1:
+        return matches[0]
+
+    eprint(f"Multiple matches for filter '{filt}':")
+    return prompt_pick(matches)
+
+
+def extract_asm_block(amdgcn_s: Path, symbol: str, out_path: Path):
+    # Grab the whole .text.<symbol> section to include metadata (.amdhsa_kernel, .set vgpr/sgpr, etc.)
+    start_pat = re.compile(r"^\s*\.section\s+\.text\." + re.escape(symbol) + r"\b")
+    next_section_pat = re.compile(r"^\s*\.section\s+\.text\.")
+
+    keep = False
+    found = False
+    with amdgcn_s.open("r", encoding="utf-8", errors="ignore") as f_in, out_path.open("w", encoding="utf-8") as f_out:
+        for line in f_in:
+            if start_pat.search(line):
+                keep = True
+                found = True
+            if keep:
+                # Stop when the next .text section begins (and it's not our own header line)
+                if found and next_section_pat.search(line) and not start_pat.search(line):
+                    break
+                f_out.write(line)
+
+    if not found:
+        eprint(f"[llvmir] warning: symbol not found in amdgcn.s: {symbol}")
+
+
+def extract_metadata_from_readobj(readobj: str, obj_path: Path, symbol: str, out_path: Path):
+    proc = subprocess.run(
+        [readobj, "--notes", str(obj_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if proc.returncode != 0:
+        eprint(proc.stderr)
+        raise ToolError("llvm-readobj failed.")
+
+    lines = proc.stdout.splitlines()
+    meta_start = next((i for i, line in enumerate(lines) if "AMDGPU Metadata:" in line), None)
+    kernels_line = next((i for i, line in enumerate(lines) if line.strip() == "amdhsa.kernels:"), None)
+
+    header = []
+    if meta_start is not None and kernels_line is not None and meta_start <= kernels_line:
+        header = lines[meta_start:kernels_line + 1]
+
+    # Parse kernel blocks under amdhsa.kernels
+    blocks = []
+    current = None
+    if kernels_line is not None:
+        for line in lines[kernels_line + 1:]:
+            if line.startswith("  - .args:"):
+                if current:
+                    blocks.append(current)
+                current = [line]
+                continue
+            if current is not None:
+                # End of metadata block if indentation collapses
+                if line.startswith("NoteSection") or line.startswith("}"):
+                    break
+                current.append(line)
+        if current:
+            blocks.append(current)
+
+    selected = None
+    for block in blocks:
+        if any(".name:" in line and symbol in line for line in block):
+            selected = block
+            break
+
+    if selected is None:
+        # Fallback: keep a context window around the first matching line
+        match_idx = next((i for i, line in enumerate(lines) if symbol in line), None)
+        if match_idx is None:
+            selected = lines
+        else:
+            lo = max(0, match_idx - 30)
+            hi = min(len(lines), match_idx + 200)
+            selected = lines[lo:hi]
+        out_path.write_text("\n".join(selected) + "\n", encoding="utf-8")
+        return
+
+    out_path.write_text("\n".join(header + selected) + "\n", encoding="utf-8")
+
+
+def run_llvmir(cfg: dict, filt: str | None):
+    kernel = cfg["kernel"]
+    out_base = cfg["out"]
+
+    kernel_dir = out_base / kernel
+    dump_dir = pick_latest_dir(kernel_dir)
+    if dump_dir is None:
+        eprint("[llvmir] no dump found, running dump first")
+        dump_dir = run_dump(cfg)
+
+    map_path = dump_dir / "mangled_map.tsv"
+    if not map_path.exists():
+        eprint("[llvmir] mangled_map.tsv missing, running dump first")
+        dump_dir = run_dump(cfg)
+        map_path = dump_dir / "mangled_map.tsv"
+
+    items = load_map(map_path)
+    if not items:
+        raise ToolError("mangled_map.tsv is empty.")
+
+    if filt:
+        mangled, demangled = filter_pick(items, filt)
+    else:
+        mangled, demangled = prompt_pick(items)
+
+    eprint(f"[llvmir] selected: {demangled}")
+
+    # Prepare llvmir output folder
+    llvmir_root = dump_dir / "llvmir"
+    llvmir_root.mkdir(parents=True, exist_ok=True)
+    sym_dir = llvmir_root / safe_name(mangled)
+    sym_dir.mkdir(parents=True, exist_ok=True)
+
+    # Re-run compile with IR dump
+    tu_rel = SUPPORTED_KERNELS[kernel]
+    cc_path = find_compile_commands(cfg["llamacpp"], cfg.get("build_dir"))
+    entry = load_compile_command(cc_path, tu_rel)
+    cmd_tools = clang_tools_from_command(shlex.split(entry["command"]))
+
+    out_obj = sym_dir / "mmvq.cu.o"
+    extra = ["--save-temps=obj", "-mllvm", "-print-after-all", "-mllvm", f"-filter-print-funcs={mangled}"]
+    cmd, workdir = build_command(entry, out_obj, extra)
+
+    log_path = sym_dir / "llvmir.log"
+    eprint(f"[llvmir] writing log: {log_path}")
+
+    with log_path.open("w", encoding="utf-8") as log:
+        proc = subprocess.run(cmd, cwd=workdir, stdout=log, stderr=log)
+
+    if proc.returncode != 0:
+        raise ToolError("Compilation failed during llvmir.")
+
+    # Extract asm block for chosen symbol
+    amdgcn_s = dump_dir / "amdgcn.s"
+    if amdgcn_s.exists():
+        asm_out = sym_dir / "asm.s"
+        extract_asm_block(amdgcn_s, mangled, asm_out)
+
+    device_out = find_device_out(sym_dir)
+    if device_out:
+        metadata_out = sym_dir / "metadata.txt"
+        extract_metadata_from_readobj(cmd_tools["llvm_readobj"], device_out, mangled, metadata_out)
+    else:
+        eprint("[llvmir] warning: device .out not found; metadata.txt not generated")
+
+    clean_dir(sym_dir, keep_files={"llvmir.log", "asm.s", "metadata.txt"})
+
+
+def main():
+    parser = argparse.ArgumentParser(description="llama-kernel tool")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("dump", help="dump amdgcn.s, device.bc, and mangled map")
+    p_ir = sub.add_parser("llvmir", help="dump LLVM IR for a selected symbol")
+    p_ir.add_argument("--filter", dest="filter", default=None, help="demangled substring to select symbol")
+
+    args = parser.parse_args()
+
+    cfg = resolve_paths(load_config())
+
+    try:
+        if args.cmd == "dump":
+            run_dump(cfg)
+        elif args.cmd == "llvmir":
+            run_llvmir(cfg, args.filter)
+        else:
+            raise ToolError(f"Unknown command: {args.cmd}")
+    except ToolError as e:
+        eprint(f"error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

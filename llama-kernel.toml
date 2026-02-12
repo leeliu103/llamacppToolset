@@ -1,0 +1,6 @@
+# llama-kernel config
+llamacpp = "/app/llama.cpp"
+out = "/app/kernel_dumps"
+kernel = "mmvq"
+# Optional: point to a build dir that contains compile_commands.json
+# build_dir = "/app/llama.cpp/build"
