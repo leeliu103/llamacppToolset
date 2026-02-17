@@ -503,7 +503,7 @@ def run_llvmir(cfg: dict, filt: str | None):
     # Prepare llvmir output folder
     llvmir_root = dump_dir / "llvmir"
     llvmir_root.mkdir(parents=True, exist_ok=True)
-    sym_dir = llvmir_root / safe_name(mangled)
+    sym_dir = llvmir_root / safe_name(demangled)
     sym_dir.mkdir(parents=True, exist_ok=True)
 
     # Re-run compile with IR dump
@@ -566,7 +566,7 @@ def run_patch(cfg: dict, filt: str | None):
     eprint(f"[patch] selected: {demangled}")
 
     # Locate snippet asm
-    sym_dir = dump_dir / "llvmir" / safe_name(mangled)
+    sym_dir = dump_dir / "llvmir" / safe_name(demangled)
     snippet_path = sym_dir / "asm.s"
     if not snippet_path.exists():
         raise ToolError(f"Missing asm.s for symbol. Run llvmir first: {sym_dir}")
