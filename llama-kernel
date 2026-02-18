@@ -233,6 +233,33 @@ def find_device_out(out_dir: Path) -> Path | None:
     return device_out[0]
 
 
+def relink_ggml_hip(build_root: Path):
+    link_txt = build_root / "ggml" / "src" / "ggml-hip" / "CMakeFiles" / "ggml-hip.dir" / "link.txt"
+    if not link_txt.exists():
+        raise ToolError(f"link.txt not found for ggml-hip: {link_txt}")
+    cmd_line = link_txt.read_text(encoding="utf-8", errors="ignore").strip()
+    if not cmd_line:
+        raise ToolError(f"link.txt is empty: {link_txt}")
+    # link.txt paths are relative to the ggml-hip build dir
+    ggml_hip_build = build_root / "ggml" / "src" / "ggml-hip"
+    cmd_parts = shlex.split(cmd_line)
+    out_path = None
+    if "-o" in cmd_parts:
+        out_idx = cmd_parts.index("-o")
+        if out_idx + 1 < len(cmd_parts):
+            out_path = Path(cmd_parts[out_idx + 1])
+    proc = subprocess.run(cmd_line, shell=True, cwd=ggml_hip_build)
+    if proc.returncode != 0:
+        raise ToolError("Relink of ggml-hip failed after patching mmvq.cu.o.")
+    # link.txt usually outputs a versioned SONAME file; update libggml-hip.so.0 if needed
+    if out_path is not None:
+        if not out_path.is_absolute():
+            out_path = (ggml_hip_build / out_path).resolve()
+        so_path = build_root / "bin" / "libggml-hip.so.0"
+        if out_path.exists() and out_path != so_path:
+            shutil.copy2(out_path, so_path)
+
+
 def generate_mangled_map(llvm_dis: str, bc_path: Path, out_map: Path) -> int:
     proc = subprocess.run([llvm_dis, str(bc_path), "-o", "-"],
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -665,13 +692,9 @@ def run_patch(cfg: dict, filt: str | None):
         shutil.copy2(so_path, so_backup)
         eprint(f"[patch] backed up: {so_backup}")
 
-    proc = subprocess.run(
-        [cmd_tools["llvm_objcopy"], f"--update-section", f".hip_fatbin={hip_fatbin_new}", str(so_path)]
-    )
-    if proc.returncode != 0:
-        raise ToolError("Failed to update .hip_fatbin section in libggml-hip.so.0.")
-
-    eprint(f"[patch] applied to: {so_path}")
+    eprint("[patch] relinking ggml-hip to update libggml-hip.so.0")
+    relink_ggml_hip(build_root)
+    eprint(f"[patch] relinked: {so_path}")
 
 
 def run_restore(cfg: dict):
